@@ -11,7 +11,7 @@ import akka.stream.{Attributes, Outlet, SourceShape}
 import com.amazonaws.AmazonWebServiceRequest
 import com.amazonaws.handlers.AsyncHandler
 import com.amazonaws.regions.Regions
-import com.amazonaws.services.kinesis.model._
+import com.amazonaws.services.kinesis.model.{Shard => _, _}
 import com.amazonaws.services.kinesis.{AmazonKinesisAsync, AmazonKinesisAsyncClientBuilder}
 
 import scala.collection.JavaConverters._
@@ -19,6 +19,7 @@ import scala.concurrent.ExecutionContext
 import scala.util.{Failure, Success, Try}
 
 object KinesisSource {
+
 
   private [timeout] val region: Regions =
     Option(Regions.getCurrentRegion)
@@ -28,7 +29,9 @@ object KinesisSource {
   private[timeout] lazy val kinesis: AmazonKinesisAsync =
     AmazonKinesisAsyncClientBuilder.standard.withRegion(region).build
 
+
   private [timeout] case class ShardIterator(
+    shard: Shard,
     iterator: String,
     reissue: GetShardIteratorRequest
   )
@@ -48,7 +51,7 @@ object KinesisSource {
         .withShardIteratorType("AFTER_SEQUENCE_NUMBER")
         .withStartingSequenceNumber(lastRecord.getSequenceNumber)
     }
-    ShardIterator(g.getNextShardIterator, reissue)
+    ShardIterator(s.shard, g.getNextShardIterator, reissue)
   }
 
   /**
@@ -71,19 +74,20 @@ object KinesisSource {
     */
   private[timeout] def shardIteratorRequests(
     since: ZonedDateTime,
-    stream: StreamDescription
+    shards: List[Shard],
+    stream: String
   )(
     implicit
     clock: Clock
-  ): List[GetShardIteratorRequest] =
-    stream.getShards.asScala.toList.map { shard =>
-    val now = clock.instant
-    val readFrom = if (since.toInstant.isBefore(now)) since.toInstant else now
-    new GetShardIteratorRequest()
-      .withShardIteratorType("AT_TIMESTAMP")
-      .withTimestamp(Date.from(readFrom))
-      .withStreamName(stream.getStreamName)
-      .withShardId(shard.getShardId)
+  ): List[(Shard, GetShardIteratorRequest)] =
+    shards.map { shard =>
+      val now = clock.instant
+      val readFrom = if (since.toInstant.isBefore(now)) since.toInstant else now
+      shard -> new GetShardIteratorRequest()
+        .withShardIteratorType("AT_TIMESTAMP")
+        .withTimestamp(Date.from(readFrom))
+        .withStreamName(stream)
+        .withShardId(shard.id)
   }
 }
 
@@ -135,16 +139,25 @@ private[timeout] class KinesisSource(
       override def onPull() = Unit
     })
 
+
+    private def beginReadingFromShards(shards: List[Shard]): Unit =
+      shardIteratorRequests(since, shards, streamName).foreach { case (shard, request) =>
+        run(request)(kinesis.getShardIteratorAsync) { iteratorResult =>
+          Option(iteratorResult.get.getShardIterator).fold {
+            log.warning(s"$streamName: No iterator for $shard")
+          } { it =>
+            log.debug(s"$streamName: Beginning to read from ${shard.id}")
+            getRecords(ShardIterator(shard, it, request))
+          }
+        }
+      }
+
     /**
       * bootstrap everything by getting initial shard iterators
       * Any errors here are essentially unrecoverable so we explode, hence the .gets
       */
     run(streamName)(kinesis.describeStreamAsync) { stream =>
-      shardIteratorRequests(since, stream.get.getStreamDescription).foreach { request =>
-        run(request)(kinesis.getShardIteratorAsync) { iteratorResult =>
-          getRecords(ShardIterator(iteratorResult.get.getShardIterator, request))
-        }
-      }
+      beginReadingFromShards(Shard.fromAws(stream.get.getStreamDescription.getShards.asScala.toList))
     }
 
     /**
@@ -163,7 +176,12 @@ private[timeout] class KinesisSource(
       */
     private def emitThenGetRecords(currentIterator: ShardIterator, result: GetRecordsResult): Unit = {
       emitMultiple[ByteBuffer](outlet, result.getRecords.asScala.map(_.getData).toList, { () =>
-        getRecords(nextIterator(currentIterator, result))
+        Option(result.getNextShardIterator).fold {
+          log.debug(s"${currentIterator.shard.id} has been closed")
+          beginReadingFromShards(currentIterator.shard.children)
+        } { _ =>
+          getRecords(nextIterator(currentIterator, result))
+        }
       })
     }
 
